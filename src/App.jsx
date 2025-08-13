@@ -10,19 +10,22 @@ import { Download, Upload, Plus, Trash2, Edit3, Save, X, Archive, Settings, Undo
 /*****************************
  * Utility & Storage Helpers *
  *****************************/
+// Keys used in localStorage
 const LS_KEY = "eduardo_budget_tracker_v1";
 const UNDO_KEY = "eduardo_budget_tracker_undo";
 
 const now = new Date();
 
+// Default data for the application.  Added an emergencyReserve property and set the
+// second payment day to the 15th.  Users can change this later in the settings.
 const defaultData = {
   theme: "light",
   currency: "USD",
   income: {
     schedule: {
       firstPaymentDay: 30,
-      secondPaymentDay: 30,
-      bonusMonths: [4, 9], // April, September (0-indexed months in JS are 0-11; we store 1-12 for clarity and convert)
+      secondPaymentDay: 15, // always on the 15th
+      bonusMonths: [4, 9], // April, September (1-based)
     },
     payments: {
       first: 8125.04,
@@ -34,6 +37,7 @@ const defaultData = {
       september: 45000,
     }
   },
+  emergencyReserve: 100, // minimum cash to keep unallocated
   categories: [
     // 1st Payment
     { id: "cat_tesla", name: "Tesla", cycle: "first", planned: 562.72, color: "#4F46E5", status: "active", type:"fixed" },
@@ -55,7 +59,7 @@ const defaultData = {
     { id: "citi_wizeline", name: "Citi Simplicity (Wizeline)", cycle: "second", planned: 0, color: "#93C5FD", status: "active", type:"debt" },
     { id: "claude", name: "Claude (Anthropic)", cycle: "second", planned: 20, color: "#FDE68A", status: "active", type:"fixed" },
     { id: "extra_cc", name: "Additional Credit Card Payments", cycle: "second", planned: 0, color: "#A7F3D0", status: "active", type:"debt" },
-    // Bonus (allocation buckets)
+    // Bonus
     { id: "bonus_home", name: "Home Improvements", cycle: "bonus", planned: 0, color: "#7C3AED", status: "active", type:"bucket" },
     { id: "bonus_family", name: "Family Support", cycle: "bonus", planned: 0, color: "#DB2777", status: "active", type:"bucket" },
     { id: "bonus_business", name: "Business Investments (Hummus Haven)", cycle: "bonus", planned: 0, color: "#2563EB", status: "active", type:"bucket" },
@@ -63,7 +67,7 @@ const defaultData = {
     { id: "bonus_cc", name: "Credit Card Payoffs", cycle: "bonus", planned: 0, color: "#DC2626", status: "active", type:"bucket" },
     { id: "bonus_emergency", name: "Emergency Fund Transfer", cycle: "bonus", planned: 0, color: "#1F2937", status: "active", type:"bucket" },
   ],
-  transactions: [], // {id, date, categoryId, amount, note}
+  transactions: [],
   archivedCategoryIds: [],
   deletedCategoryIds: [],
   order: {
@@ -73,6 +77,7 @@ const defaultData = {
   }
 };
 
+// Load state from localStorage or use default
 function loadState(){
   try{
     const raw = localStorage.getItem(LS_KEY);
@@ -90,7 +95,6 @@ function pushUndo(state){
   const stackRaw = localStorage.getItem(UNDO_KEY);
   const stack = stackRaw ? JSON.parse(stackRaw) : [];
   stack.push(state);
-  // cap history
   if(stack.length>30) stack.shift();
   localStorage.setItem(UNDO_KEY, JSON.stringify(stack));
 }
@@ -103,7 +107,7 @@ function popUndo(){
 }
 
 /*******************
- * Small UI helpers *
+ * UI Helpers      *
  *******************/
 const Badge = ({ children, tone="default" }) => (
   <span className={`text-xs px-2 py-0.5 rounded-full border ${tone==="active"?"bg-green-50 border-green-200 text-green-700": tone==="archived"?"bg-amber-50 border-amber-200 text-amber-700": tone==="deleted"?"bg-rose-50 border-rose-200 text-rose-700":"bg-slate-50 border-slate-200 text-slate-600"}`}>{children}</span>
@@ -137,8 +141,10 @@ export default function App(){
   const [tab, setTab] = useState("overview");
   const [query, setQuery] = useState("");
   const [quickEdit, setQuickEdit] = useState(false);
-  const [confirm, setConfirm] = useState(null); // {type, payload}
-  const [contextFor, setContextFor] = useState(null); // category id for context menu
+  const [confirm, setConfirm] = useState(null);
+  const [contextFor, setContextFor] = useState(null);
+  // New: filter to show only first or second cycle in overview
+  const [cycleFilter, setCycleFilter] = useState(null); // null=all, 'first' or 'second'
 
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -163,7 +169,6 @@ export default function App(){
   }),[categoriesByCycle]);
 
   const incomeMonthly = useMemo(()=>{
-    // handle February special case for first payment
     const isFeb = (new Date()).getMonth()===1;
     const first = isFeb ? state.income.payments.febFirst : state.income.payments.first;
     return { first, second: state.income.payments.second };
@@ -181,12 +186,10 @@ export default function App(){
       return next;
     });
   }
-
   function undo(){
     const prev = popUndo();
     if(prev){ setState(prev); }
   }
-
   function toggleTheme(){ setState(s=>({...s, theme: s.theme==="dark"?"light":"dark"})); }
 
   function addCategory(cycle){
@@ -204,9 +207,15 @@ export default function App(){
   function updateCategory(id, patch){
     setAndUndo(prev=> ({...prev, categories: prev.categories.map(c=> c.id===id? {...c, ...patch }: c)}));
   }
-
   function archiveCategory(id){ updateCategory(id,{status:"archived"}); }
   function activateCategory(id){ updateCategory(id,{status:"active"}); }
+
+  // Two-step delete: first prompt, then confirm
+  function removeCategory(id){
+    const cat = state.categories.find(c=>c.id===id);
+    if(!cat) return;
+    setConfirm({ type: "deletePrompt", payload: { id, name: cat.name } });
+  }
 
   function permanentlyDeleteCategory(id){
     setAndUndo(prev=> ({
@@ -217,14 +226,10 @@ export default function App(){
     }));
   }
 
-  function removeCategory(id){
-    setConfirm({ type:"delete", payload:id });
-  }
-
   function onDragEnd(event, cycle){
     const {active, over} = event;
     if(!over || active.id===over.id) return;
-    setAndUndo(prev=>{
+    setAndUndo(prev=> {
       const old = prev.order[cycle] || [];
       const oldIndex = old.indexOf(active.id);
       const newIndex = old.indexOf(over.id);
@@ -245,11 +250,10 @@ export default function App(){
   }
 
   function exportCSV(){
-    // Export categories & transactions
     const rows = [];
     rows.push(["TYPE","ID","DATE","NAME","CYCLE","PLANNED","STATUS","AMOUNT","NOTE"].join(","));
     state.categories.forEach(c=>{
-      rows.push(["CATEGORY",c.id,"",escapeCsv(c.name),c.cycle,c.planned,c.status,"",""] .join(","));
+      rows.push(["CATEGORY",c.id,"",escapeCsv(c.name),c.cycle,c.planned,c.status,"",""].join(","));
     });
     state.transactions.forEach(t=>{
       const c = state.categories.find(c=>c.id===t.categoryId);
@@ -261,7 +265,6 @@ export default function App(){
     a.href = url; a.download = 'budget_export.csv'; a.click();
     URL.revokeObjectURL(url);
   }
-
   function importCSV(file){
     const reader = new FileReader();
     reader.onload = (e)=>{
@@ -292,7 +295,7 @@ export default function App(){
             categoryId: (function(){
               const name = unescapeCsv(parts[idx("NAME")]);
               const found = next.categories.find(c=>c.name===name);
-              return found?.id || name; // try by id later
+              return found?.id || name;
             })(),
             amount: Number(parts[idx("AMOUNT")])||0,
             note: unescapeCsv(parts[idx("NOTE")])
@@ -313,11 +316,12 @@ export default function App(){
     if(action==="delete"){ removeCategory(id); }
   }
 
-  // Filtered categories for search
+  // Filtered search for settings panel
   const filtered = useMemo(()=> state.categories.filter(c=> c.name.toLowerCase().includes(query.toLowerCase())),[state.categories, query]);
 
+  // Render
   return (
-    <div className={`${themeClass} font-sans`}> 
+    <div className={`${themeClass} font-sans`}>
       <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100">
         <header className="sticky top-0 z-30 backdrop-blur supports-[backdrop-filter]:bg-white/60 dark:supports-[backdrop-filter]:bg-slate-900/60 bg-white/80 dark:bg-slate-900/80 border-b border-slate-200 dark:border-slate-800">
           <div className="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
@@ -347,10 +351,10 @@ export default function App(){
           </div>
           <nav className="max-w-6xl mx-auto px-4 pb-2">
             <div className="flex gap-2">
-              <TabButton active={tab==="overview"} onClick={()=>setTab("overview")} icon={ListChecks} label="Overview"/>
-              <TabButton active={tab==="calendar"} onClick={()=>setTab("calendar")} icon={CalendarIcon} label="Calendar"/>
-              <TabButton active={tab==="bonus"} onClick={()=>setTab("bonus")} icon={Gift} label="Bonus Planner"/>
-              <TabButton active={tab==="settings"} onClick={()=>setTab("settings")} icon={SlidersHorizontal} label="Settings / Management"/>
+              <TabButton active={tab==="overview"} onClick={()=>{ setTab("overview"); setCycleFilter(null); }} icon={ListChecks} label="Overview"/>
+              <TabButton active={tab==="calendar"} onClick={()=>{ setTab("calendar"); setCycleFilter(null); }} icon={CalendarIcon} label="Calendar"/>
+              <TabButton active={tab==="bonus"} onClick={()=>{ setTab("bonus"); setCycleFilter(null); }} icon={Gift} label="Bonus Planner"/>
+              <TabButton active={tab==="settings"} onClick={()=>{ setTab("settings"); setCycleFilter(null); }} icon={SlidersHorizontal} label="Settings / Management"/>
             </div>
           </nav>
         </header>
@@ -369,10 +373,12 @@ export default function App(){
               updateCategory={updateCategory}
               onContextAction={onContextAction}
               onDragEnd={onDragEnd}
+              cycleFilter={cycleFilter}
+              setCycleFilter={setCycleFilter}
             />
           )}
           {tab==="calendar" && (
-            <CalendarView state={state}/>
+            <CalendarView state={state} setCycleFilter={setCycleFilter} />
           )}
           {tab==="bonus" && (
             <BonusPlanner state={state} setAndUndo={setAndUndo} />
@@ -387,6 +393,12 @@ export default function App(){
         </footer>
 
         <AnimatePresence>
+          {confirm?.type==="deletePrompt" && (
+            <ConfirmDialog onClose={()=>setConfirm(null)} onConfirm={()=>{ setConfirm({ type:"delete", payload: confirm.payload.id }); }}>
+              <h3 className="text-lg font-semibold mb-1">Delete {confirm.payload.name}?</h3>
+              <p className="text-sm text-slate-600 dark:text-slate-300">Are you sure you want to remove this category?</p>
+            </ConfirmDialog>
+          )}
           {confirm?.type==="delete" && (
             <ConfirmDialog onClose={()=>setConfirm(null)} onConfirm={()=>{ permanentlyDeleteCategory(confirm.payload); setConfirm(null); }}>
               <h3 className="text-lg font-semibold mb-1">Permanently delete this category?</h3>
@@ -402,25 +414,50 @@ export default function App(){
 /****************
  * Tab: Overview *
  ****************/
-function Overview({state, categoriesByCycle, plannedTotals, incomeMonthly, remaining, quickEdit, setQuickEdit, addCategory, updateCategory, onContextAction, onDragEnd}){
+function Overview({state, categoriesByCycle, plannedTotals, incomeMonthly, remaining, quickEdit, setQuickEdit, addCategory, updateCategory, onContextAction, onDragEnd, cycleFilter, setCycleFilter}){
+  // Determine which cycles to display based on filter
+  const displayFirst = !cycleFilter || cycleFilter === 'first';
+  const displaySecond = !cycleFilter || cycleFilter === 'second';
+
   return (
     <div className="grid gap-6">
       <div className="grid md:grid-cols-2 gap-4">
-        <IncomeCard label="1st Payment" amount={incomeMonthly.first} planned={plannedTotals.first} remaining={remaining.first} color="from-indigo-500 to-sky-400"/>
-        <IncomeCard label="2nd Payment" amount={incomeMonthly.second} planned={plannedTotals.second} remaining={remaining.second} color="from-emerald-500 to-teal-400"/>
+        {displayFirst && (
+          <div onClick={()=>{ setCycleFilter(cycleFilter? null : 'first'); }} className="cursor-pointer">
+            <IncomeCard label="1st Payment" amount={incomeMonthly.first} planned={plannedTotals.first} remaining={remaining.first} color="from-indigo-500 to-sky-400" reserve={state.emergencyReserve}/>
+          </div>
+        )}
+        {displaySecond && (
+          <div onClick={()=>{ setCycleFilter(cycleFilter? null : 'second'); }} className="cursor-pointer">
+            <IncomeCard label="2nd Payment" amount={incomeMonthly.second} planned={plannedTotals.second} remaining={remaining.second} color="from-emerald-500 to-teal-400" reserve={state.emergencyReserve}/>
+          </div>
+        )}
       </div>
 
+      {/* Show Back button if a cycle is filtered */}
+      {cycleFilter && (
+        <div>
+          <button onClick={()=> setCycleFilter(null)} className="inline-flex items-center gap-2 px-3 py-2 rounded-xl border bg-slate-100 dark:bg-slate-800 dark:border-slate-700">Back to Overview</button>
+        </div>
+      )}
+
       <div className="flex items-center justify-between">
-        <h2 className="text-xl font-semibold">Planned Expenses</h2>
+        <h2 className="text-xl font-semibold">Planned Expenses {cycleFilter && (<span className="text-sm text-slate-500 dark:text-slate-400">({cycleFilter === 'first' ? '1st Payment' : '2nd Payment'})</span>)}</h2>
         <div className="flex items-center gap-2">
           <IconBtn icon={Edit3} label={quickEdit?"Done":"Quick Edit"} onClick={()=>setQuickEdit(!quickEdit)} className={quickEdit?"bg-indigo-50 border-indigo-200 text-indigo-700":""} />
         </div>
       </div>
 
       <div className="grid lg:grid-cols-3 gap-6">
-        <CycleColumn title="1st Payment" cycle="first" list={categoriesByCycle.first} order={state.order.first} addCategory={addCategory} quickEdit={quickEdit} updateCategory={updateCategory} onContextAction={onContextAction} onDragEnd={onDragEnd} />
-        <CycleColumn title="2nd Payment" cycle="second" list={categoriesByCycle.second} order={state.order.second} addCategory={addCategory} quickEdit={quickEdit} updateCategory={updateCategory} onContextAction={onContextAction} onDragEnd={onDragEnd} />
-        <CycleColumn title="Bonus Buckets" cycle="bonus" list={categoriesByCycle.bonus} order={state.order.bonus} addCategory={addCategory} quickEdit={quickEdit} updateCategory={updateCategory} onContextAction={onContextAction} onDragEnd={onDragEnd} />
+        {displayFirst && (
+          <CycleColumn title="1st Payment" cycle="first" list={categoriesByCycle.first} order={state.order.first} addCategory={addCategory} quickEdit={quickEdit} updateCategory={updateCategory} onContextAction={onContextAction} onDragEnd={onDragEnd} />
+        )}
+        {displaySecond && (
+          <CycleColumn title="2nd Payment" cycle="second" list={categoriesByCycle.second} order={state.order.second} addCategory={addCategory} quickEdit={quickEdit} updateCategory={updateCategory} onContextAction={onContextAction} onDragEnd={onDragEnd} />
+        )}
+        {(!cycleFilter || cycleFilter === 'bonus') && (
+          <CycleColumn title="Bonus Buckets" cycle="bonus" list={categoriesByCycle.bonus} order={state.order.bonus} addCategory={addCategory} quickEdit={quickEdit} updateCategory={updateCategory} onContextAction={onContextAction} onDragEnd={onDragEnd} />
+        )}
       </div>
 
       <div className="grid lg:grid-cols-2 gap-6">
@@ -431,8 +468,15 @@ function Overview({state, categoriesByCycle, plannedTotals, incomeMonthly, remai
   );
 }
 
-function IncomeCard({label, amount, planned, remaining, color}){
+function IncomeCard({label, amount, planned, remaining, color, reserve}){
   const percent = Math.min(100, Math.max(0, (planned/Math.max(1,amount))*100));
+  const remainingAfterReserve = remaining - (reserve||0);
+  let warning = null;
+  if(remainingAfterReserve <= 0){
+    warning = <div className="text-xs mt-1 text-rose-600">Alert: Reserve reached</div>;
+  } else if(remainingAfterReserve <= 500){
+    warning = <div className="text-xs mt-1 text-amber-600">Warning: Within $500 of reserve</div>;
+  }
   return (
     <div className="rounded-2xl border bg-white dark:bg-slate-900 dark:border-slate-800 p-4 shadow-sm">
       <div className="flex items-center gap-3">
@@ -449,6 +493,7 @@ function IncomeCard({label, amount, planned, remaining, color}){
       <div className="mt-3 h-2 rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
         <div className="h-full bg-indigo-500" style={{width: `${percent}%`}}/>
       </div>
+      {warning}
     </div>
   );
 }
@@ -479,15 +524,12 @@ function CycleColumn({title, cycle, list, order=[], addCategory, quickEdit, upda
 function CategoryRow({cat, quickEdit, updateCategory, onContextAction}){
   const [editing, setEditing] = useState(false);
   const [tmp, setTmp] = useState({ name: cat.name, planned: cat.planned });
-
   useEffect(()=>{ setTmp({name:cat.name, planned:cat.planned}); },[cat.id]);
-
   const statusTone = cat.status==="active"?"active": cat.status==="archived"?"archived":"deleted";
-
   return (
     <div
       onContextMenu={(e)=>{e.preventDefault(); onContextAction(cat.status==="active"?"archive":"activate", cat.id);}}
-      className={`group rounded-xl border p-3 bg-white dark:bg-slate-900 dark:border-slate-800 hover:shadow-sm transition ${cat.status!=="active"?"opacity-60": ""}`}
+      className={`group rounded-xl border p-3 bg-white dark:bg-slate-900 dark:border-slate-800 hover:shadow-sm transition ${cat.status!=="active"?"opacity-60":""}`}
     >
       <div className="flex items-center gap-3">
         <div className="h-3 w-3 rounded-full" style={{background:cat.color}}/>
@@ -511,7 +553,7 @@ function CategoryRow({cat, quickEdit, updateCategory, onContextAction}){
           {editing && (
             <>
               <button onClick={()=>{ updateCategory(cat.id, {name: tmp.name, planned: Number(tmp.planned)||0}); setEditing(false); }} className="px-2 py-1 rounded-lg bg-emerald-600 text-white text-xs inline-flex items-center gap-1"><Save className="h-3 w-3"/>Save</button>
-              <button onClick={()=>setEditing(false)} className="px-2 py-1 rounded-lg bg-slate-200 dark:bg-slate-700 text-slate-800 dark:text-slate-100 text-xs inline-flex items-кыргыз gap-1"><X className="h-3 w-3"/>Cancel</button>
+              <button onClick={()=>setEditing(false)} className="px-2 py-1 rounded-lg bg-slate-200 dark:bg-slate-700 text-slate-800 dark:text-slate-100 text-xs inline-flex items-center gap-1"><X className="h-3 w-3"/>Cancel</button>
             </>
           )}
           {!editing && (
@@ -532,7 +574,6 @@ function CategoryRow({cat, quickEdit, updateCategory, onContextAction}){
  * Charts & Visualizations
  ***********************/
 function SpendingPie({state}){
-  // Aggregate actuals by category
   const byCat = useMemo(()=>{
     const map = new Map();
     state.transactions.forEach(t=>{
@@ -540,9 +581,7 @@ function SpendingPie({state}){
     });
     return state.categories.filter(c=>c.status!=="deleted").map(c=> ({ name: c.name, value: Math.abs(map.get(c.id)||0), color: c.color }));
   },[state.transactions, state.categories]);
-
   const data = byCat.filter(d=>d.value>0).slice(0,10);
-
   return (
     <div className="rounded-2xl border bg-white dark:bg-slate-900 dark:border-slate-800 p-4 shadow-sm">
       <div className="flex items-center justify-between mb-2"><h3 className="font-semibold">Top Actual Spending</h3></div>
@@ -567,11 +606,9 @@ function PlannedVsActual({state}){
     const planMap = new Map(state.categories.filter(c=>c.status!=="deleted").map(c=>[c.id, Number(c.planned)||0]));
     const actMap = new Map();
     state.transactions.forEach(t=>{ actMap.set(t.categoryId, (actMap.get(t.categoryId)||0) + Number(t.amount)); });
-    // top by planned
     const cats = state.categories.filter(c=>c.status!=="deleted").slice(0,8);
     return cats.map(c=> ({ name: c.name.slice(0,12), Planned: planMap.get(c.id)||0, Actual: Math.abs(actMap.get(c.id)||0) }));
   },[state.categories, state.transactions]);
-
   return (
     <div className="rounded-2xl border bg-white dark:bg-slate-900 dark:border-slate-800 p-4 shadow-sm">
       <div className="flex items-center justify-between mb-2"><h3 className="font-semibold">Planned vs. Actual</h3></div>
@@ -595,18 +632,16 @@ function PlannedVsActual({state}){
 /****************
  * Calendar View *
  ****************/
-function CalendarView({state}){
+function CalendarView({state, setCycleFilter}){
   const [monthOffset, setMonthOffset] = useState(0);
   const base = new Date();
   const current = new Date(base.getFullYear(), base.getMonth()+monthOffset, 1);
   const monthName = current.toLocaleString(undefined,{month:"long", year:"numeric"});
-
   const days = buildCalendarDays(current);
-  const pay1 = state.income.schedule.firstPaymentDay;
-  const pay2 = state.income.schedule.secondPaymentDay;
-
-  const bonusMonths = state.income.schedule.bonusMonths; // [4,9] (1-based for UI)
-
+  // Payment dates: 1st payment is the last day of the month, 2nd is always the 15th
+  const pay1 = new Date(current.getFullYear(), current.getMonth()+1, 0).getDate();
+  const pay2 = 15;
+  const bonusMonths = state.income.schedule.bonusMonths;
   return (
     <div className="rounded-2xl border bg-white dark:bg-slate-900 dark:border-slate-800 p-4 shadow-sm">
       <div className="flex items-center justify-between mb-4">
@@ -618,22 +653,20 @@ function CalendarView({state}){
         </div>
       </div>
       <div className="grid grid-cols-7 gap-2 text-sm">
-        {['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>(<div key={d} className="text-center text-slate-500">{d}</div>))}
+        {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map(d=>(<div key={d} className="text-center text-slate-500">{d}</div>))}
         {days.map((d,idx)=>{
           const isThisMonth = d.getMonth()===current.getMonth();
           const day = d.getDate();
-
           const isPay1 = isThisMonth && day===pay1;
           const isPay2 = isThisMonth && day===pay2;
           const isBonus = isThisMonth && (bonusMonths.includes(current.getMonth()+1)) && (day===pay1 || day===pay2);
-
           return (
             <div key={idx} className={`h-24 rounded-xl border p-2 ${isThisMonth?"bg-white dark:bg-slate-900 dark:border-slate-800":"bg-slate-50 dark:bg-slate-800/40 border-slate-200 dark:border-slate-800"}`}>
               <div className="flex items-center justify-between text-xs">
                 <span className="text-slate-500">{day}</span>
                 <div className="flex gap-1">
-                  {isPay1 && <Badge tone="active">1st Pay</Badge>}
-                  {isPay2 && <Badge tone="active">2nd Pay</Badge>}
+                  {isPay1 && <span onClick={()=>setCycleFilter('first')} className="cursor-pointer"><Badge tone="active">1st Pay</Badge></span>}
+                  {isPay2 && <span onClick={()=>setCycleFilter('second')} className="cursor-pointer"><Badge tone="active">2nd Pay</Badge></span>}
                 </div>
               </div>
               {isBonus && (
@@ -653,15 +686,10 @@ function CalendarView({state}){
 function BonusPlanner({state, setAndUndo}){
   const [april, setApril] = useState(state.income.bonus.april||0);
   const [sept, setSept] = useState(state.income.bonus.september||0);
-
   const bonusCats = state.categories.filter(c=>c.cycle==="bonus" && c.status!=="deleted");
-
   const [alloc, setAlloc] = useState(()=> Object.fromEntries(bonusCats.map(c=>[c.id, Number(c.planned)||0])));
-
   useEffect(()=>{ setAlloc(Object.fromEntries(bonusCats.map(c=>[c.id, Number(c.planned)||0]))); },[state.categories.length]);
-
   const totalAlloc = Object.values(alloc).reduce((s,n)=>s+Number(n||0),0);
-
   function save(){
     setAndUndo(prev=> ({
       ...prev,
@@ -669,7 +697,6 @@ function BonusPlanner({state, setAndUndo}){
       categories: prev.categories.map(c=> c.cycle==="bonus"? { ...c, planned: Number(alloc[c.id]||0) } : c)
     }));
   }
-
   return (
     <div className="grid gap-6">
       <div className="rounded-2xl border bg-white dark:bg-slate-900 dark:border-slate-800 p-4 shadow-sm">
@@ -679,7 +706,6 @@ function BonusPlanner({state, setAndUndo}){
           <LabeledInput label="September (end of month)" value={sept} onChange={setSept} type="number"/>
         </div>
       </div>
-
       <div className="rounded-2xl border bg-white dark:bg-slate-900 dark:border-slate-800 p-4 shadow-sm">
         <div className="flex items-center justify-between mb-3">
           <h3 className="font-semibold">Allocate Bonus to Buckets</h3>
@@ -714,19 +740,19 @@ function SettingsPanel({state, setAndUndo, filtered, onContextAction, addTransac
   const [firstFeb, setFirstFeb] = useState(state.income.payments.febFirst);
   const [secondAmt, setSecondAmt] = useState(state.income.payments.second);
   const [bonusMonths, setBonusMonths] = useState(state.income.schedule.bonusMonths.join(", "));
-
+  const [reserve, setReserve] = useState(state.emergencyReserve||100);
   function saveIncome(){
-    const months = bonusMonths.split(/[,,\s]+/).map(n=>Number(n)).filter(n=>n>=1 && n<=12);
+    const months = bonusMonths.split(/[,\s]+/).map(n=>Number(n)).filter(n=>n>=1 && n<=12);
     setAndUndo(prev=> ({
       ...prev,
       income: {
         ...prev.income,
         schedule: { ...prev.income.schedule, firstPaymentDay:Number(firstDay), secondPaymentDay:Number(secondDay), bonusMonths: months },
         payments: { ...prev.income.payments, first:Number(firstAmt), febFirst:Number(firstFeb), second:Number(secondAmt) }
-      }
+      },
+      emergencyReserve: Math.max(100, Number(reserve)||100)
     }));
   }
-
   function addNewCategory(){
     const cycle = prompt("Cycle? first / second / bonus", "first");
     if(!["first","second","bonus"].includes((cycle||"").toLowerCase())) return;
@@ -736,19 +762,16 @@ function SettingsPanel({state, setAndUndo, filtered, onContextAction, addTransac
     const color = randomColor();
     setAndUndo(prev=> ({...prev, categories: [...prev.categories, {id,name,cycle:cycle.toLowerCase(),planned,color,status:"active", type:"variable"}], order: { ...prev.order, [cycle]: [...(prev.order[cycle]||[]), id]}}));
   }
-
-  // Bulk archive/delete
   function bulk(action){
     const names = prompt(`Enter category names or ids to ${action} (comma-separated)`);
     if(!names) return;
-    const tokens = names.split(/[,,\s]+/).filter(Boolean);
+    const tokens = names.split(/[,.\s]+/).filter(Boolean);
     if(action==="archive"){ setAndUndo(prev=> ({...prev, categories: prev.categories.map(c=> tokens.includes(c.id)||tokens.includes(c.name)? {...c, status:"archived"} : c)})); }
     if(action==="activate"){ setAndUndo(prev=> ({...prev, categories: prev.categories.map(c=> tokens.includes(c.id)||tokens.includes(c.name)? {...c, status:"active"} : c)})); }
     if(action==="delete"){
       setAndUndo(prev=> ({...prev, categories: prev.categories.filter(c=> !(tokens.includes(c.id)||tokens.includes(c.name))), order: Object.fromEntries(Object.entries(prev.order).map(([k,arr])=>[k, arr.filter(id=> !tokens.includes(id))])) }));
     }
   }
-
   return (
     <div className="grid gap-6">
       <div className="rounded-2xl border bg-white dark:bg-slate-900 dark:border-slate-800 p-4 shadow-sm">
@@ -760,8 +783,9 @@ function SettingsPanel({state, setAndUndo, filtered, onContextAction, addTransac
           <LabeledInput label="1st Payment Day" value={firstDay} onChange={setFirstDay} type="number"/>
           <LabeledInput label="2nd Payment Day" value={secondDay} onChange={setSecondDay} type="number"/>
           <LabeledInput label="Bonus Months (1-12, comma separated)" value={bonusMonths} onChange={setBonusMonths}/>
+          <LabeledInput label="Emergency Reserve (min $100)" value={reserve} onChange={setReserve} type="number"/>
         </div>
-        <div className="mt-3"><button onClick={saveIncome} className="px-4 py-2 rounded-xl bg-indigo-600 text-white">Save Income & Schedule</button></div>
+        <div className="mt-3"><button onClick={saveIncome} className="px-4 py-2 rounded-xl bg-indigo-600 text-white">Save Income & Settings</button></div>
       </div>
 
       <div className="rounded-2xl border bg-white dark:bg-slate-900 dark:border-slate-800 p-4 shadow-sm">
@@ -792,7 +816,7 @@ function SettingsPanel({state, setAndUndo, filtered, onContextAction, addTransac
                     <div className="font-medium">{c.name}</div>
                     <div className="text-xs text-slate-500">{c.id}</div>
                   </td>
-                  <td className="p-2 capitalize">{c.cycle}</td>
+                    <td className="p-2 capitalize">{c.cycle}</td>
                   <td className="p-2">${Number(c.planned||0).toLocaleString()}</td>
                   <td className="p-2"><Badge tone={c.status==="active"?"active":c.status==="archived"?"archived":"deleted"}>{c.status}</Badge></td>
                   <td className="p-2 text-right">
@@ -866,12 +890,9 @@ function randomColor(){
   const s = 70; const l = 55;
   return `hsl(${h} ${s}% ${l}%)`;
 }
-
 function escapeCsv(s){ return '"'+String(s).replaceAll('"','""')+'"'; }
 function unescapeCsv(s){ return String(s||"").replace(/^\"|\"$/g, '').replaceAll('""','"'); }
-
 function splitCsv(line){
-  // split CSV respecting quotes
   const out = []; let curr = ''; let inQ = false;
   for(let i=0;i<line.length;i++){
     const ch=line[i];
@@ -884,7 +905,6 @@ function splitCsv(line){
   out.push(curr);
   return out;
 }
-
 function upsertCategory(state, cat){
   const idx = state.categories.findIndex(c=>c.id===cat.id);
   if(idx>=0) state.categories[idx] = { ...state.categories[idx], ...cat };
@@ -893,11 +913,10 @@ function upsertCategory(state, cat){
   if(!arr.includes(cat.id)) arr.push(cat.id);
   state.order[cat.cycle] = arr;
 }
-
 function buildCalendarDays(monthDate){
   const first = new Date(monthDate.getFullYear(), monthDate.getMonth(), 1);
   const start = new Date(first);
-  start.setDate(first.getDate() - first.getDay()); // back to Sunday
+  start.setDate(first.getDate() - first.getDay());
   const days = [];
   for(let i=0;i<42;i++){
     const d = new Date(start);
